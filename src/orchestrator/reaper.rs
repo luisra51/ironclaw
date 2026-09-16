@@ -18,7 +18,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::context::ContextManager;
+use crate::context::{ContextManager, JobState};
+use crate::db::Database;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::sandbox::connect_docker;
 
@@ -48,6 +49,7 @@ pub struct SandboxReaper {
     docker: bollard::Docker,
     job_manager: Arc<ContainerJobManager>,
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
     config: ReaperConfig,
 }
 
@@ -56,6 +58,7 @@ impl SandboxReaper {
     pub async fn new(
         job_manager: Arc<ContainerJobManager>,
         context_manager: Arc<ContextManager>,
+        store: Option<Arc<dyn Database>>,
         config: ReaperConfig,
     ) -> Result<Self, crate::sandbox::SandboxError> {
         let docker = connect_docker().await?;
@@ -63,6 +66,7 @@ impl SandboxReaper {
             docker,
             job_manager,
             context_manager,
+            store,
             config,
         })
     }
@@ -88,6 +92,42 @@ impl SandboxReaper {
     }
 
     async fn scan_and_reap(&self) {
+        // First reconcile jobs whose workers vanished before they could call
+        // report_complete. This releases ContextManager concurrency slots and
+        // gives wait=true callers a terminal handle to observe.
+        for (job_id, reason) in self.job_manager.reconcile_dead_containers().await {
+            tracing::warn!(job_id = %job_id, %reason, "Reaper: active job container died");
+            match self
+                .context_manager
+                .update_context(job_id, |context| {
+                    context.transition_to(JobState::Failed, Some(reason.clone()))
+                })
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(job_id = %job_id, %error, "Reaper: invalid dead job state transition");
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = %job_id, %error, "Reaper: failed to find dead job context");
+                }
+            }
+            if let Some(store) = self.store.as_ref()
+                && let Err(error) = store
+                    .update_sandbox_job_status(
+                        job_id,
+                        "failed",
+                        Some(false),
+                        Some(&reason),
+                        None,
+                        Some(Utc::now()),
+                    )
+                    .await
+            {
+                tracing::warn!(job_id = %job_id, %error, "Reaper: failed to persist dead job status");
+            }
+        }
+
         let containers = match self.list_ironclaw_containers().await {
             Ok(c) => c,
             Err(e) => {

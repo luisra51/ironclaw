@@ -1263,8 +1263,12 @@ async fn async_main() -> anyhow::Result<()> {
         .into_iter()
         .flatten(),
     );
-    // Clone context_manager for the reaper before it's moved into Agent::new()
+    // Clone reaper dependencies before AppComponents is moved into AgentDeps.
     let reaper_context_manager = Arc::clone(&components.context_manager);
+    let reaper_store: Option<Arc<dyn ironclaw::db::Database>> = components
+        .db
+        .as_ref()
+        .map(|store| Arc::clone(store) as Arc<dyn ironclaw::db::Database>);
 
     // Capture settings store for SIGHUP handler before AppComponents is consumed.
     // Prefer the workspace-backed adapter (so SIGHUP-driven config reloads pick
@@ -1359,8 +1363,9 @@ async fn async_main() -> anyhow::Result<()> {
             ..ReaperConfig::default()
         };
         let reaper_ctx = Arc::clone(&reaper_context_manager);
+        let reaper_db = reaper_store.clone();
         tokio::spawn(async move {
-            match SandboxReaper::new(reaper_jm, reaper_ctx, reaper_config).await {
+            match SandboxReaper::new(reaper_jm, reaper_ctx, reaper_db, reaper_config).await {
                 Ok(reaper) => reaper.run().await,
                 Err(e) => tracing::error!("Sandbox reaper failed to initialize: {}", e),
             }

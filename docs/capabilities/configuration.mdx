@@ -425,6 +425,7 @@ These variables are resolved by the current `src/config/` modules but are less c
 | `SANDBOX_ORPHAN_THRESHOLD_SECS` | Age threshold for orphaned sandbox containers. |
 | `ACP_ENABLED` | Enables ACP mode. |
 | `ACP_TIMEOUT_SECS` | ACP command timeout. |
+| `ACP_FOLLOWUP_IDLE_SECS` | Maximum idle time between prompts for interactive ACP or Claude Code jobs (default: 300 seconds). |
 | `ACP_MEMORY_LIMIT_MB` | ACP memory limit. |
 | `WASM_ENABLED` | Enables WASM tools. |
 | `WASM_TOOLS_DIR` | WASM tools directory. |
@@ -433,6 +434,8 @@ These variables are resolved by the current `src/config/` modules but are less c
 | `WASM_DEFAULT_TIMEOUT_SECS` | Default WASM execution timeout. |
 | `WASM_DEFAULT_MEMORY_LIMIT` | Default WASM memory limit. |
 | `WASM_DEFAULT_FUEL_LIMIT` | Default WASM fuel limit. |
+
+ACP and Claude Code sandbox jobs created with `wait=true` run one turn and terminate. Jobs created with `wait=false` accept `job_prompt` follow-ups until `done=true`, the agent process exits, or `ACP_FOLLOWUP_IDLE_SECS` elapses without a new prompt.
 
 ### Skills, routines, heartbeat, and builder mode
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(sandbox)* make `wait=true` ACP and Claude jobs one-shot, bound interactive follow-ups with an idle timeout, and preserve final `done=true` prompt content.
+- *(sandbox)* persist terminal job state and reconcile worker containers that exit before reporting completion.
+- *(sandbox)* serialize initial job persistence before mode updates to avoid restart metadata races.
+
 ## [0.29.1](https://github.com/nearai/ironclaw/compare/ironclaw-v0.29.0...ironclaw-v0.29.1) - 2026-06-04
 
 ### Added

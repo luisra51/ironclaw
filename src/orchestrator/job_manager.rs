@@ -770,6 +770,81 @@ impl ContainerJobManager {
         Ok(())
     }
 
+    /// Reconcile active handles with Docker and mark containers that exited or
+    /// disappeared without reporting completion as failed.
+    pub async fn reconcile_dead_containers(&self) -> Vec<(Uuid, String)> {
+        let docker = match self.docker().await {
+            Ok(docker) => docker,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to connect to Docker for job reconciliation");
+                return Vec::new();
+            }
+        };
+        let candidates: Vec<(Uuid, String)> = self
+            .containers
+            .read()
+            .await
+            .values()
+            .filter(|handle| {
+                matches!(
+                    handle.state,
+                    ContainerState::Creating | ContainerState::Running
+                ) && !handle.container_id.is_empty()
+            })
+            .map(|handle| (handle.job_id, handle.container_id.clone()))
+            .collect();
+
+        let mut dead = Vec::new();
+        for (job_id, container_id) in candidates {
+            let reason = match docker.inspect_container(&container_id, None).await {
+                Ok(details)
+                    if details.state.as_ref().and_then(|state| state.running) == Some(true) =>
+                {
+                    continue;
+                }
+                Ok(details) => {
+                    let exit_code = details.state.and_then(|state| state.exit_code);
+                    match exit_code {
+                        Some(code) => format!("container exited unexpectedly (exit code {code})"),
+                        None => "container exited unexpectedly".to_string(),
+                    }
+                }
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => "container disappeared unexpectedly".to_string(),
+                Err(error) => {
+                    tracing::warn!(job_id = %job_id, %error, "Failed to inspect job container");
+                    continue;
+                }
+            };
+
+            let marked = {
+                let mut containers = self.containers.write().await;
+                match containers.get_mut(&job_id) {
+                    Some(handle)
+                        if matches!(
+                            handle.state,
+                            ContainerState::Creating | ContainerState::Running
+                        ) =>
+                    {
+                        handle.state = ContainerState::Failed;
+                        handle.completion_result = Some(CompletionResult {
+                            success: false,
+                            message: Some(reason.clone()),
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if marked {
+                self.token_store.revoke(job_id).await;
+                dead.push((job_id, reason));
+            }
+        }
+        dead
+    }
+
     /// Remove a completed job handle from memory (called after result is read).
     pub async fn cleanup_job(&self, job_id: Uuid) {
         // Clean up per-job MCP config temp file if one was written.
