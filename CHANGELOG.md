@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-09-17
+
 ### Fixed
 
 - *(sandbox)* make `wait=true` ACP and Claude jobs one-shot, bound interactive follow-ups with an idle timeout, and preserve final `done=true` prompt content.
 - *(sandbox)* persist terminal job state and reconcile worker containers that exit before reporting completion.
 - *(sandbox)* serialize initial job persistence before mode updates to avoid restart metadata races.
+- *(bridge)* measure the follow-up idle timeout from the end of the agent turn so long turns cannot close an interactive job.
+
+### Added
+
+- *(config)* `ACP_FOLLOWUP_IDLE_SECS` to configure the interactive follow-up idle timeout (default 300s).
 
 ## [0.29.1](https://github.com/nearai/ironclaw/compare/ironclaw-v0.29.0...ironclaw-v0.29.1) - 2026-06-04
 
