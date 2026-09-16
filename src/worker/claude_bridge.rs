@@ -322,8 +322,6 @@ impl ClaudeBridgeRuntime {
 
                 match poll_result {
                     Ok(Some(prompt)) => {
-                        idle_deadline =
-                            tokio::time::Instant::now() + self.config.follow_up.idle_timeout;
                         if !prompt.content.trim().is_empty() {
                             iteration += 1;
                             tracing::info!(
@@ -358,6 +356,10 @@ impl ClaudeBridgeRuntime {
                             );
                             break;
                         }
+                        // Measure idle time from the end of the Claude turn so
+                        // long turns cannot trip the idle timeout.
+                        idle_deadline =
+                            tokio::time::Instant::now() + self.config.follow_up.idle_timeout;
                     }
                     Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
                     Err(e) => {

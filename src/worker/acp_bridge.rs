@@ -484,7 +484,6 @@ async fn run_follow_up_loop(
         let backoff = match poll_result {
             Ok(Some(follow_up)) => {
                 consecutive_poll_errors = 0;
-                idle_deadline = tokio::time::Instant::now() + idle_timeout;
 
                 // A final prompt may contain useful wrap-up instructions. Send
                 // non-empty content before honoring done=true.
@@ -512,6 +511,9 @@ async fn run_follow_up_loop(
                     tracing::debug!(job_id = %job_id, "Orchestrator signaled done");
                     break;
                 }
+                // Measure idle time from the end of the agent turn, not from
+                // prompt receipt, so long turns cannot trip the idle timeout.
+                idle_deadline = tokio::time::Instant::now() + idle_timeout;
                 continue;
             }
             Ok(None) => {
@@ -1065,6 +1067,71 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "status");
         assert_eq!(events[0].data["type"], "idle_timeout");
+    }
+
+    /// Sender that simulates a long agent turn (longer than the idle timeout).
+    struct SlowAcpPromptSender {
+        turn_duration: Duration,
+    }
+
+    impl AcpPromptSender for SlowAcpPromptSender {
+        async fn send_prompt(
+            &self,
+            _session_id: acp::SessionId,
+            _content: String,
+        ) -> acp::Result<acp::PromptResponse> {
+            tokio::time::sleep(self.turn_duration).await;
+            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        }
+    }
+
+    /// Regression: idle time must be measured from the end of the agent turn.
+    /// A turn longer than the idle timeout must not close the job immediately;
+    /// the next queued prompt must still be delivered.
+    #[tokio::test(start_paused = true)]
+    async fn long_turn_does_not_trip_idle_timeout() {
+        let sink = CollectingSink::new();
+        let prompt_source = StubPromptSource::new(vec![
+            Ok(Some(PromptResponse {
+                content: "long task".to_string(),
+                done: false,
+            })),
+            Ok(Some(PromptResponse {
+                content: "second task".to_string(),
+                done: true,
+            })),
+        ]);
+        let agent = SlowAcpPromptSender {
+            turn_duration: Duration::from_secs(60),
+        };
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let session_id = acp::SessionId::new("test-session");
+
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let events = sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "turn_result")
+                .count(),
+            2,
+            "both prompts must be executed: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.data["type"] == "idle_timeout"),
+            "idle timeout must not fire after a long turn"
+        );
     }
 
     #[tokio::test]
