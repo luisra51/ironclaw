@@ -124,6 +124,7 @@ pub async fn setup_orchestrator(
             claude_code_allowed_tools: config.claude_code.allowed_tools.clone(),
             acp_memory_limit_mb: config.acp.memory_limit_mb,
             acp_timeout_secs: config.acp.timeout_secs,
+            acp_followup_idle_secs: config.acp.followup_idle_secs,
             mcp_per_job_enabled: std::env::var("MCP_PER_JOB_ENABLED")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false),

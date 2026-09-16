@@ -49,6 +49,9 @@ impl std::fmt::Display for JobMode {
 /// argument proliferation on `create_job` / `execute_sandbox`.
 #[derive(Debug, Clone, Default)]
 pub struct JobCreationParams {
+    /// Whether bridge-backed jobs should remain alive for follow-up prompts.
+    /// False means one-shot execution and is the safe default.
+    pub interactive: bool,
     /// Credential grants for the worker (served via `/credentials`).
     pub credential_grants: Vec<CredentialGrant>,
     /// Optional filter: which MCP servers to mount into the container.
@@ -100,6 +103,8 @@ pub struct ContainerJobConfig {
     pub acp_memory_limit_mb: u64,
     /// Maximum runtime for ACP bridge sessions in seconds.
     pub acp_timeout_secs: u64,
+    /// Maximum idle time between follow-up prompts for interactive bridges.
+    pub acp_followup_idle_secs: u64,
     /// Whether per-job MCP server filtering is enabled.
     /// When false, `mcp_servers` param on `create_job` is ignored.
     pub mcp_per_job_enabled: bool,
@@ -124,6 +129,7 @@ impl Default for ContainerJobConfig {
             claude_code_allowed_tools: crate::config::ClaudeCodeConfig::default().allowed_tools,
             acp_memory_limit_mb: 4096,
             acp_timeout_secs: 1800,
+            acp_followup_idle_secs: 300,
             mcp_per_job_enabled: false,
             claude_code_enabled: false,
             acp_enabled: false,
@@ -290,6 +296,14 @@ impl ContainerJobManager {
         }
     }
 
+    fn extend_bridge_env(&self, env_vec: &mut Vec<String>, interactive: bool) {
+        env_vec.push(format!("IRONCLAW_JOB_INTERACTIVE={interactive}"));
+        env_vec.push(format!(
+            "IRONCLAW_FOLLOWUP_IDLE_SECS={}",
+            self.config.acp_followup_idle_secs
+        ));
+    }
+
     fn extend_acp_env(
         &self,
         env_vec: &mut Vec<String>,
@@ -354,6 +368,7 @@ impl ContainerJobManager {
 
         // Store credential grants (revoked automatically when the token is revoked)
         let JobCreationParams {
+            interactive,
             credential_grants,
             mcp_servers,
             max_iterations,
@@ -392,6 +407,7 @@ impl ContainerJobManager {
                 max_iterations,
                 acp_agent,
                 master_mcp_config,
+                interactive,
             )
             .await
         {
@@ -416,6 +432,7 @@ impl ContainerJobManager {
         max_iterations: Option<u32>,
         acp_agent: Option<crate::config::acp::AcpAgentConfig>,
         master_mcp_config: Option<serde_json::Value>,
+        interactive: bool,
     ) -> Result<(), OrchestratorError> {
         // Connect to Docker (reuses cached connection)
         let docker = self.docker().await?;
@@ -505,6 +522,12 @@ impl ContainerJobManager {
                     self.config.claude_code_allowed_tools.join(",")
                 ));
             }
+        }
+
+        // Bridge-backed modes may either run once (`wait=true`) or remain alive
+        // for interactive follow-up prompts (`wait=false`).
+        if matches!(mode, JobMode::Acp | JobMode::ClaudeCode) {
+            self.extend_bridge_env(&mut env_vec, interactive);
         }
 
         // ACP mode: inject runtime timeout plus per-job agent command/args/env.
@@ -1129,6 +1152,21 @@ mod tests {
             err.contains("not enabled"),
             "expected mode-disabled error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_extend_bridge_env_includes_interactive_policy() {
+        let manager = ContainerJobManager::new(
+            ContainerJobConfig {
+                acp_followup_idle_secs: 45,
+                ..Default::default()
+            },
+            TokenStore::new(),
+        );
+        let mut env_vec = Vec::new();
+        manager.extend_bridge_env(&mut env_vec, true);
+        assert!(env_vec.contains(&"IRONCLAW_JOB_INTERACTIVE=true".to_string()));
+        assert!(env_vec.contains(&"IRONCLAW_FOLLOWUP_IDLE_SECS=45".to_string()));
     }
 
     #[test]

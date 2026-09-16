@@ -549,6 +549,9 @@ pub async fn jobs_restart_handler(
                     Some(project_dir),
                     mode,
                     JobCreationParams {
+                        // Restarts are one-shot unless interactive state is
+                        // explicitly persisted in a future schema revision.
+                        interactive: false,
                         credential_grants,
                         mcp_servers: restart_mcp_servers,
                         max_iterations: restart_max_iterations,

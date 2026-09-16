@@ -43,6 +43,28 @@ fn acp_bridge_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(crate::config::AcpModeConfig::from_env().timeout_secs)
 }
 
+/// Follow-up behavior shared by bridge-backed workers.
+#[derive(Debug, Clone, Copy)]
+pub struct FollowUpPolicy {
+    pub interactive: bool,
+    pub idle_timeout: std::time::Duration,
+}
+
+fn follow_up_policy_from_env() -> FollowUpPolicy {
+    let interactive = std::env::var("IRONCLAW_JOB_INTERACTIVE")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    let idle_secs = std::env::var("IRONCLAW_FOLLOWUP_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(300);
+    FollowUpPolicy {
+        interactive,
+        idle_timeout: std::time::Duration::from_secs(idle_secs),
+    }
+}
+
 /// Run the Worker subcommand (inside Docker containers).
 pub async fn run_worker(
     job_id: uuid::Uuid,
@@ -105,6 +127,7 @@ pub async fn run_acp_bridge(job_id: uuid::Uuid, orchestrator_url: &str) -> anyho
         job_id,
         orchestrator_url: orchestrator_url.to_string(),
         timeout: acp_bridge_timeout(),
+        follow_up: follow_up_policy_from_env(),
         agent_command,
         agent_args,
         agent_env,
@@ -138,6 +161,7 @@ pub async fn run_claude_bridge(
         max_turns,
         model: model.to_string(),
         timeout: std::time::Duration::from_secs(1800),
+        follow_up: follow_up_policy_from_env(),
         allowed_tools: crate::config::ClaudeCodeConfig::from_env().allowed_tools,
     };
 
@@ -169,5 +193,35 @@ mod tests {
         assert_eq!(acp_bridge_timeout(), std::time::Duration::from_secs(45));
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
         unsafe { std::env::remove_var("ACP_TIMEOUT_SECS") };
+    }
+
+    #[test]
+    fn follow_up_policy_defaults_to_one_shot() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::remove_var("IRONCLAW_JOB_INTERACTIVE");
+            std::env::remove_var("IRONCLAW_FOLLOWUP_IDLE_SECS");
+        }
+        let policy = follow_up_policy_from_env();
+        assert!(!policy.interactive);
+        assert_eq!(policy.idle_timeout, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn follow_up_policy_respects_env() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("IRONCLAW_JOB_INTERACTIVE", "true");
+            std::env::set_var("IRONCLAW_FOLLOWUP_IDLE_SECS", "45");
+        }
+        let policy = follow_up_policy_from_env();
+        unsafe {
+            std::env::remove_var("IRONCLAW_JOB_INTERACTIVE");
+            std::env::remove_var("IRONCLAW_FOLLOWUP_IDLE_SECS");
+        }
+        assert!(policy.interactive);
+        assert_eq!(policy.idle_timeout, std::time::Duration::from_secs(45));
     }
 }

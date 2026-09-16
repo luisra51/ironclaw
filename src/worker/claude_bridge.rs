@@ -45,6 +45,7 @@ pub struct ClaudeBridgeConfig {
     pub max_turns: u32,
     pub model: String,
     pub timeout: Duration,
+    pub follow_up: crate::worker::FollowUpPolicy,
     /// Tool patterns to auto-approve via project-level settings.json.
     pub allowed_tools: Vec<String>,
 }
@@ -270,10 +271,20 @@ impl ClaudeBridgeRuntime {
             Ok(sid) => sid,
             Err(e) => {
                 tracing::error!(job_id = %self.config.job_id, "Claude session failed: {}", e);
+                let message = format!("Claude Code failed: {e}");
+                self.client
+                    .post_event(&JobEventPayload {
+                        event_type: "result".to_string(),
+                        data: serde_json::json!({
+                            "status": "error",
+                            "message": &message,
+                        }),
+                    })
+                    .await;
                 self.client
                     .report_complete(&CompletionReport {
                         success: false,
-                        message: Some(format!("Claude Code failed: {}", e)),
+                        message: Some(message),
                         iterations: 1,
                     })
                     .await?;
@@ -281,57 +292,105 @@ impl ClaudeBridgeRuntime {
             }
         };
 
-        // Follow-up loop: poll for prompts, resume Claude sessions
         let mut iteration = 1u32;
-        loop {
-            // Poll for a follow-up prompt (2 second intervals)
-            match self.poll_for_prompt().await {
-                Ok(Some(prompt)) => {
-                    if prompt.done {
-                        tracing::info!(job_id = %self.config.job_id, "Orchestrator signaled done");
-                        break;
-                    }
-                    iteration += 1;
-                    tracing::info!(
-                        job_id = %self.config.job_id,
-                        "Got follow-up prompt, resuming session"
-                    );
-                    if let Err(e) = self
-                        .run_claude_session(&prompt.content, session_id.as_deref(), &extra_env)
-                        .await
-                    {
-                        tracing::error!(
+        if self.config.follow_up.interactive {
+            // Interactive jobs accept prompts until explicitly closed or idle.
+            let mut idle_deadline =
+                tokio::time::Instant::now() + self.config.follow_up.idle_timeout;
+            loop {
+                let poll_result = tokio::select! {
+                    result = self.poll_for_prompt() => result,
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        tracing::info!(
                             job_id = %self.config.job_id,
-                            "Follow-up Claude session failed: {}", e
+                            idle_secs = self.config.follow_up.idle_timeout.as_secs(),
+                            "Claude follow-up idle timeout reached"
                         );
-                        // Don't fail the whole job on a follow-up error, just report it
                         self.report_event(
                             "status",
                             &serde_json::json!({
-                                "message": format!("Follow-up session failed: {}", e),
+                                "message": format!(
+                                    "Follow-up idle timeout ({}s) reached; finishing job",
+                                    self.config.follow_up.idle_timeout.as_secs()
+                                ),
+                                "type": "idle_timeout",
                             }),
-                        )
-                        .await;
+                        ).await;
+                        break;
+                    }
+                };
+
+                match poll_result {
+                    Ok(Some(prompt)) => {
+                        idle_deadline =
+                            tokio::time::Instant::now() + self.config.follow_up.idle_timeout;
+                        if !prompt.content.trim().is_empty() {
+                            iteration += 1;
+                            tracing::info!(
+                                job_id = %self.config.job_id,
+                                "Got follow-up prompt, resuming session"
+                            );
+                            if let Err(e) = self
+                                .run_claude_session(
+                                    &prompt.content,
+                                    session_id.as_deref(),
+                                    &extra_env,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    job_id = %self.config.job_id,
+                                    "Follow-up Claude session failed: {}", e
+                                );
+                                self.report_event(
+                                    "status",
+                                    &serde_json::json!({
+                                        "message": format!("Follow-up session failed: {}", e),
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                        if prompt.done {
+                            tracing::info!(
+                                job_id = %self.config.job_id,
+                                "Orchestrator signaled done"
+                            );
+                            break;
+                        }
+                    }
+                    Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %self.config.job_id,
+                            "Prompt polling error: {}", e
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
-                Ok(None) => {
-                    // No prompt available, wait and poll again
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        job_id = %self.config.job_id,
-                        "Prompt polling error: {}", e
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
             }
+        } else {
+            tracing::info!(
+                job_id = %self.config.job_id,
+                "One-shot Claude Code job completed initial turn"
+            );
         }
 
+        let message = "Claude Code session completed".to_string();
+        self.client
+            .post_event(&JobEventPayload {
+                event_type: "result".to_string(),
+                data: serde_json::json!({
+                    "status": "completed",
+                    "message": &message,
+                    "session_id": session_id,
+                }),
+            })
+            .await;
         self.client
             .report_complete(&CompletionReport {
                 success: true,
-                message: Some("Claude Code session completed".to_string()),
+                message: Some(message),
                 iterations: iteration,
             })
             .await?;
@@ -668,8 +727,10 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<JobEventPayload> {
                 });
             }
 
+            // A CLI result ends one Claude turn, not the entire sandbox job.
+            // `run()` emits the single terminal `result` after follow-ups end.
             payloads.push(JobEventPayload {
-                event_type: "result".to_string(),
+                event_type: "turn_result".to_string(),
                 data: serde_json::json!({
                     "status": if is_error { "error" } else { "completed" },
                     "session_id": event.session_id,
@@ -955,7 +1016,7 @@ mod tests {
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0].event_type, "message");
         assert_eq!(payloads[0].data["content"], "The review is complete.");
-        assert_eq!(payloads[1].event_type, "result");
+        assert_eq!(payloads[1].event_type, "turn_result");
         assert_eq!(payloads[1].data["status"], "completed");
     }
 

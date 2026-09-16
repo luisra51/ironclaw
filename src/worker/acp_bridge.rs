@@ -42,6 +42,7 @@ pub struct AcpBridgeConfig {
     pub job_id: Uuid,
     pub orchestrator_url: String,
     pub timeout: Duration,
+    pub follow_up: crate::worker::FollowUpPolicy,
     /// Command to spawn the ACP agent.
     pub agent_command: String,
     /// Arguments for the agent command.
@@ -194,6 +195,7 @@ impl AcpBridgeRuntime {
         let prompt_owned = prompt.to_string();
         let job_id = self.config.job_id;
         let timeout = self.config.timeout;
+        let follow_up = self.config.follow_up;
 
         // Clone client for follow-up loop
         let client_for_followup = Arc::clone(&self.client);
@@ -268,28 +270,32 @@ impl AcpBridgeRuntime {
                 );
                 client_for_acp.post_event(&result_payload).await;
 
-                // Follow-up loop: poll for prompts, send additional prompt() calls.
-                // Exits when: orchestrator sends done, or agent process exits.
-                let prompt_sender = ConnPromptSender { conn: &conn };
-                run_follow_up_loop(
-                    &client_for_followup,
-                    &prompt_sender,
-                    &client_for_acp,
-                    &session_id,
-                    child_exit_rx,
-                    job_id,
-                )
-                .await?;
+                if follow_up.interactive {
+                    // Interactive jobs accept prompts until explicitly closed,
+                    // idle timeout, or agent-process exit.
+                    let prompt_sender = ConnPromptSender { conn: &conn };
+                    run_follow_up_loop(
+                        &client_for_followup,
+                        &prompt_sender,
+                        &client_for_acp,
+                        &session_id,
+                        child_exit_rx,
+                        job_id,
+                        follow_up.idle_timeout,
+                    )
+                    .await?;
+                } else {
+                    tracing::info!(job_id = %job_id, "One-shot ACP job completed initial turn");
+                }
 
                 Ok::<(), WorkerError>(())
             })
             .await;
 
-        // Kill the child on protocol failure so stderr closes (see kill channel above).
-        if acp_result.is_err() {
-            let _ = kill_tx.send(());
-        }
-
+        // The ACP server is a stdio daemon and may remain alive after the turn.
+        // Terminate it after both successful and failed protocol completion so
+        // stderr reaches EOF and the worker can report completion.
+        let _ = kill_tx.send(());
         let _ = stderr_handle.await;
 
         acp_result
@@ -447,12 +453,14 @@ async fn run_follow_up_loop(
     session_id: &acp::SessionId,
     mut child_exit_rx: tokio::sync::oneshot::Receiver<Option<i32>>,
     job_id: Uuid,
+    idle_timeout: Duration,
 ) -> Result<(), WorkerError> {
     let session_id_str = session_id.to_string();
     let mut consecutive_poll_errors: u32 = 0;
+    let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        // Race poll_prompt against child exit so we detect process death
-        // even during a long-poll HTTP request to the orchestrator.
+        // Race prompt polling against both child exit and the interactive idle
+        // deadline. This also works if poll_prompt itself blocks indefinitely.
         let poll_result = tokio::select! {
             result = prompt_source.poll_prompt() => result,
             exit_code = &mut child_exit_rx => {
@@ -460,31 +468,49 @@ async fn run_follow_up_loop(
                 tracing::debug!(job_id = %job_id, exit_code = ?code, "ACP agent exited, ending follow-up loop");
                 break;
             }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::info!(job_id = %job_id, idle_secs = idle_timeout.as_secs(), "ACP follow-up idle timeout reached");
+                sink.emit_event(&JobEventPayload {
+                    event_type: "status".to_string(),
+                    data: json!({
+                        "message": format!("Follow-up idle timeout ({}s) reached; finishing job", idle_timeout.as_secs()),
+                        "type": "idle_timeout",
+                    }),
+                }).await;
+                break;
+            }
         };
 
         let backoff = match poll_result {
             Ok(Some(follow_up)) => {
                 consecutive_poll_errors = 0;
+                idle_deadline = tokio::time::Instant::now() + idle_timeout;
+
+                // A final prompt may contain useful wrap-up instructions. Send
+                // non-empty content before honoring done=true.
+                if !follow_up.content.trim().is_empty() {
+                    tracing::debug!(job_id = %job_id, "Got follow-up prompt");
+                    let follow_result = agent
+                        .send_prompt(session_id.clone(), follow_up.content)
+                        .await;
+
+                    match follow_result {
+                        Ok(resp) => {
+                            let payload =
+                                stop_reason_to_turn_event(&resp.stop_reason, &session_id_str);
+                            sink.emit_event(&payload).await;
+                        }
+                        Err(e) => {
+                            let msg = format!("Follow-up prompt failed: {e}");
+                            tracing::error!(job_id = %job_id, "{}", msg);
+                            return Err(WorkerError::ExecutionFailed { reason: msg });
+                        }
+                    }
+                }
+
                 if follow_up.done {
                     tracing::debug!(job_id = %job_id, "Orchestrator signaled done");
                     break;
-                }
-                tracing::debug!(job_id = %job_id, "Got follow-up prompt");
-
-                let follow_result = agent
-                    .send_prompt(session_id.clone(), follow_up.content)
-                    .await;
-
-                match follow_result {
-                    Ok(resp) => {
-                        let payload = stop_reason_to_turn_event(&resp.stop_reason, &session_id_str);
-                        sink.emit_event(&payload).await;
-                    }
-                    Err(e) => {
-                        let msg = format!("Follow-up prompt failed: {e}");
-                        tracing::error!(job_id = %job_id, "{}", msg);
-                        return Err(WorkerError::ExecutionFailed { reason: msg });
-                    }
                 }
                 continue;
             }
@@ -793,6 +819,7 @@ mod tests {
     /// Stub ACP prompt sender that returns pre-configured results.
     struct StubAcpPromptSender {
         results: Mutex<Vec<acp::Result<acp::PromptResponse>>>,
+        prompts: Mutex<Vec<String>>,
     }
 
     impl StubAcpPromptSender {
@@ -800,7 +827,12 @@ mod tests {
             results.reverse(); // so we can pop (FIFO)
             Self {
                 results: Mutex::new(results),
+                prompts: Mutex::new(Vec::new()),
             }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
         }
     }
 
@@ -808,8 +840,9 @@ mod tests {
         async fn send_prompt(
             &self,
             _session_id: acp::SessionId,
-            _content: String,
+            content: String,
         ) -> acp::Result<acp::PromptResponse> {
+            self.prompts.lock().unwrap().push(content);
             self.results
                 .lock()
                 .unwrap()
@@ -834,8 +867,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -879,8 +920,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -930,7 +979,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()),
+            run_follow_up_loop(
+                &prompt_source,
+                &agent,
+                &sink,
+                &session_id,
+                rx,
+                Uuid::nil(),
+                Duration::from_secs(30),
+            ),
         )
         .await;
 
@@ -985,6 +1042,60 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn follow_up_loop_exits_on_idle_timeout() {
+        let sink = CollectingSink::new();
+        let agent = StubAcpPromptSender::new(vec![]);
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let session_id = acp::SessionId::new("test-session");
+
+        let result = run_follow_up_loop(
+            &ForeverPromptSource,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "status");
+        assert_eq!(events[0].data["type"], "idle_timeout");
+    }
+
+    #[tokio::test]
+    async fn done_with_content_sends_final_prompt_before_exit() {
+        let sink = CollectingSink::new();
+        let prompt_source = StubPromptSource::new(vec![Ok(Some(PromptResponse {
+            content: "write final summary".to_string(),
+            done: true,
+        }))]);
+        let agent =
+            StubAcpPromptSender::new(vec![Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))]);
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let session_id = acp::SessionId::new("test-session");
+
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(agent.prompts(), vec!["write final summary"]);
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(sink.events()[0].event_type, "turn_result");
+    }
+
     /// Verify the loop recovers from a transient polling error and
     /// processes the next prompt successfully.
     #[tokio::test(start_paused = true)]
@@ -1013,8 +1124,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -1052,8 +1171,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
         assert!(result.is_ok());
 
         let events = sink.events();
@@ -1078,8 +1205,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(result.is_err(), "Permanent error must fail immediately");
         let err = result.unwrap_err();
@@ -1113,8 +1248,16 @@ mod tests {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let session_id = acp::SessionId::new("test-session");
 
-        let result =
-            run_follow_up_loop(&prompt_source, &agent, &sink, &session_id, rx, Uuid::nil()).await;
+        let result = run_follow_up_loop(
+            &prompt_source,
+            &agent,
+            &sink,
+            &session_id,
+            rx,
+            Uuid::nil(),
+            Duration::from_secs(30),
+        )
+        .await;
 
         assert!(result.is_err(), "Should fail after exhausting retries");
         let msg = format!("{}", result.unwrap_err());

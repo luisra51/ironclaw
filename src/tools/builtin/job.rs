@@ -267,15 +267,14 @@ impl CreateJobTool {
         crate::tools::mcp::config::load_master_mcp_config_value(store.as_ref(), user_id).await
     }
 
-    /// Persist a sandbox job record (fire-and-forget).
-    fn persist_job(&self, record: SandboxJobRecord) {
-        if let Some(store) = self.store.clone() {
-            tokio::spawn(async move {
-                if let Err(e) = store.save_sandbox_job(&record).await {
-                    tracing::warn!(job_id = %record.id, "Failed to persist sandbox job: {}", e);
-                }
-            });
+    /// Persist a sandbox job record before applying dependent updates.
+    async fn persist_job(&self, record: &SandboxJobRecord) -> Result<(), ToolError> {
+        if let Some(store) = self.store.as_ref() {
+            store.save_sandbox_job(record).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to persist sandbox job: {e}"))
+            })?;
         }
+        Ok(())
     }
 
     /// Transition a sandbox job's state in the ContextManager (awaited).
@@ -458,7 +457,7 @@ impl CreateJobTool {
         // grants so a restart re-applies the original constraints instead of
         // silently falling back to the master MCP config and the default
         // worker iteration cap.
-        self.persist_job(SandboxJobRecord {
+        let record = SandboxJobRecord {
             id: job_id,
             task: task.to_string(),
             status: "creating".to_string(),
@@ -472,7 +471,13 @@ impl CreateJobTool {
             credential_grants_json,
             mcp_servers: params.mcp_servers.clone(),
             max_iterations: params.max_iterations,
-        });
+        };
+        if let Err(error) = self.persist_job(&record).await {
+            // Registration reserved a parallel-job slot; release it if the
+            // durable record could not be created.
+            let _ = self.context_manager.remove_job(job_id).await;
+            return Err(error);
+        }
 
         // Persist the job mode to DB (for non-default modes).
         // For ACP, store "acp:<agent_name>" so restarts know which agent to use.
@@ -895,8 +900,9 @@ impl Tool for CreateJobTool {
             );
             props.insert("wait".into(), serde_json::json!({
                 "type": "boolean",
-                "description": "If true (default), wait for the container to complete and return results. \
-                                If false, start the container and return the job_id immediately."
+                "description": "If true (default), run the sub-agent once, wait for completion, and return results. \
+                                If false, return the job_id immediately and keep the bridge available for job_prompt \
+                                follow-ups until done=true or the follow-up idle timeout expires."
             }));
             props.insert("project_dir".into(), serde_json::json!({
                 "type": "string",
@@ -1081,6 +1087,7 @@ impl Tool for CreateJobTool {
                 wait,
                 mode,
                 JobCreationParams {
+                    interactive: !wait,
                     credential_grants,
                     mcp_servers,
                     max_iterations,
@@ -1588,9 +1595,9 @@ impl Tool for JobPromptTool {
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up prompt to a running Claude Code sandbox job. The prompt is \
-         queued and delivered on the next poll cycle. Use this to give the sub-agent \
-         additional instructions, answer its questions, or tell it to wrap up."
+        "Send a follow-up prompt to a running interactive sandbox job (ACP or Claude Code, \
+         created with wait=false). Use done=true to close the job; optional content is executed \
+         before closing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1611,7 +1618,7 @@ impl Tool for JobPromptTool {
                                     and it should finish up. Default false."
                 }
             },
-            "required": ["job_id", "content"]
+            "required": ["job_id"]
         })
     }
 
@@ -1648,16 +1655,24 @@ impl Tool for JobPromptTool {
                 job_id
             )));
         }
+        if job_ctx.state != JobState::InProgress {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {} is not running and does not accept follow-up prompts",
+                job_id
+            )));
+        }
 
-        let content = params
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidParameters("missing 'content' parameter".into()))?;
+        let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
         let done = params
             .get("done")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if content.trim().is_empty() && !done {
+            return Err(ToolError::InvalidParameters(
+                "content is required unless done=true".into(),
+            ));
+        }
 
         let prompt = crate::orchestrator::api::PendingPrompt {
             content: content.to_string(),
@@ -2254,8 +2269,8 @@ mod tests {
     #[tokio::test]
     async fn test_job_prompt_tool_queues_prompt() {
         let cm = Arc::new(ContextManager::new(5));
-        let job_id = cm
-            .create_job_for_user("default", "Test Job", "desc")
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "default", "Test Job", "desc")
             .await
             .unwrap(); // safety: test
 
@@ -2315,18 +2330,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_prompt_tool_rejects_missing_content() {
+    async fn test_job_prompt_tool_rejects_missing_content_without_done() {
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "default", "Test Job", "desc")
+            .await
+            .unwrap();
         let queue: PromptQueue =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let tool = test_prompt_tool(queue);
+        let tool = JobPromptTool::new(queue, cm);
 
-        let params = serde_json::json!({
-            "job_id": Uuid::new_v4().to_string(),
-        });
+        let result = tool
+            .execute(
+                serde_json::json!({ "job_id": job_id.to_string() }),
+                &JobContext::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidParameters(_))));
+    }
 
-        let ctx = JobContext::default();
-        let result = tool.execute(params, &ctx).await;
-        assert!(result.is_err()); // safety: test
+    #[tokio::test]
+    async fn test_job_prompt_tool_allows_done_without_content() {
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "default", "Test Job", "desc")
+            .await
+            .unwrap();
+        let queue: PromptQueue =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let tool = JobPromptTool::new(Arc::clone(&queue), cm);
+
+        tool.execute(
+            serde_json::json!({ "job_id": job_id.to_string(), "done": true }),
+            &JobContext::default(),
+        )
+        .await
+        .unwrap();
+
+        let queue = queue.lock().await;
+        let prompt = queue.get(&job_id).unwrap().front().unwrap();
+        assert!(prompt.done);
+        assert!(prompt.content.is_empty());
     }
 
     #[tokio::test]

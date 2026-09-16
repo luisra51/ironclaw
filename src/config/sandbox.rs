@@ -370,6 +370,8 @@ pub struct AcpModeConfig {
     pub memory_limit_mb: u64,
     /// Maximum timeout for an ACP session in seconds.
     pub timeout_secs: u64,
+    /// Maximum idle time between interactive follow-up prompts.
+    pub followup_idle_secs: u64,
 }
 
 impl Default for AcpModeConfig {
@@ -378,6 +380,7 @@ impl Default for AcpModeConfig {
             enabled: false,
             memory_limit_mb: 4096,
             timeout_secs: 1800,
+            followup_idle_secs: 300,
         }
     }
 }
@@ -400,6 +403,10 @@ impl AcpModeConfig {
             enabled: parse_bool_env("ACP_ENABLED", settings.sandbox.acp_enabled)?,
             memory_limit_mb: parse_optional_env("ACP_MEMORY_LIMIT_MB", defaults.memory_limit_mb)?,
             timeout_secs: parse_optional_env("ACP_TIMEOUT_SECS", defaults.timeout_secs)?,
+            followup_idle_secs: parse_optional_env(
+                "ACP_FOLLOWUP_IDLE_SECS",
+                defaults.followup_idle_secs,
+            )?,
         })
     }
 
@@ -409,6 +416,10 @@ impl AcpModeConfig {
             enabled: parse_bool_env("ACP_ENABLED", defaults.enabled)?,
             memory_limit_mb: parse_optional_env("ACP_MEMORY_LIMIT_MB", defaults.memory_limit_mb)?,
             timeout_secs: parse_optional_env("ACP_TIMEOUT_SECS", defaults.timeout_secs)?,
+            followup_idle_secs: parse_optional_env(
+                "ACP_FOLLOWUP_IDLE_SECS",
+                defaults.followup_idle_secs,
+            )?,
         })
     }
 }
@@ -777,6 +788,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.memory_limit_mb, 4096);
         assert_eq!(cfg.timeout_secs, 1800);
+        assert_eq!(cfg.followup_idle_secs, 300);
     }
 
     #[test]
@@ -799,13 +811,16 @@ mod tests {
         unsafe { std::env::set_var("ACP_ENABLED", "false") };
         unsafe { std::env::set_var("ACP_MEMORY_LIMIT_MB", "8192") };
         unsafe { std::env::set_var("ACP_TIMEOUT_SECS", "3600") };
+        unsafe { std::env::set_var("ACP_FOLLOWUP_IDLE_SECS", "90") };
         let cfg = AcpModeConfig::resolve(&settings).expect("resolve");
         unsafe { std::env::remove_var("ACP_ENABLED") };
         unsafe { std::env::remove_var("ACP_MEMORY_LIMIT_MB") };
         unsafe { std::env::remove_var("ACP_TIMEOUT_SECS") };
+        unsafe { std::env::remove_var("ACP_FOLLOWUP_IDLE_SECS") };
 
         assert!(!cfg.enabled);
         assert_eq!(cfg.memory_limit_mb, 8192);
         assert_eq!(cfg.timeout_secs, 3600);
+        assert_eq!(cfg.followup_idle_secs, 90);
     }
 }
