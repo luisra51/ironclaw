@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::channels::web::types::ToolDecisionDto;
+use crate::context::JobState;
 use crate::db::Database;
 use crate::orchestrator::auth::{TokenStore, worker_auth_middleware};
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -305,6 +306,23 @@ async fn report_complete(
     };
     if let Err(e) = state.job_manager.complete_job(job_id, result).await {
         tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
+    }
+
+    // FIX: Persist job status to database (ACP jobs were not updating agent_jobs)
+    if let Some(ref store) = state.store {
+        let status = if report.success {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        let reason = if !report.success {
+            report.message.as_deref()
+        } else {
+            None
+        };
+        if let Err(e) = store.update_job_status(job_id, status, reason).await {
+            tracing::warn!(job_id = %job_id, "Failed to persist job status to DB: {}", e);
+        }
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
