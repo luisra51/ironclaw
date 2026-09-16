@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.3] - 2026-09-17
+
+### Fixed
+
+- *(acp-bridge)* bound the wait for the agent's stderr to reach EOF after the process is killed. ACP adapters that spawn their own grandchild process (for example `pi-acpinator` spawning `pi`) leak the write end of the stderr pipe, so EOF never arrived and one-shot jobs hung in `running` even after the agent had finished its turn.
+
 ## [0.29.2] - 2026-09-17
 
 ### Fixed

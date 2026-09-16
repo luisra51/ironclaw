@@ -38,6 +38,12 @@ use crate::error::WorkerError;
 use crate::worker::api::{CompletionReport, JobEventPayload, WorkerHttpClient};
 
 /// Configuration for the ACP bridge runtime.
+/// How long to wait for the agent's stderr pipe to reach EOF after the process
+/// has been killed, before abandoning the reader. Adapters that spawn their own
+/// grandchildren (e.g. `pi-acpinator` spawning `pi`) leak the write end of the
+/// pipe, so EOF may never arrive.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 pub struct AcpBridgeConfig {
     pub job_id: Uuid,
     pub orchestrator_url: String,
@@ -295,8 +301,26 @@ impl AcpBridgeRuntime {
         // The ACP server is a stdio daemon and may remain alive after the turn.
         // Terminate it after both successful and failed protocol completion so
         // stderr reaches EOF and the worker can report completion.
+        tracing::debug!(job_id = %job_id, "ACP session ended; terminating agent process");
         let _ = kill_tx.send(());
-        let _ = stderr_handle.await;
+
+        // Killing the direct child is not enough to guarantee EOF: adapters such
+        // as pi-acpinator spawn their own grandchild (`pi`) which inherits the
+        // stderr pipe and keeps the write end open indefinitely. Bound the wait
+        // and abort the reader so the worker can always report completion.
+        let stderr_abort = stderr_handle.abort_handle();
+        match tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                stderr_abort.abort();
+                tracing::warn!(
+                    job_id = %job_id,
+                    grace_secs = STDERR_DRAIN_GRACE.as_secs(),
+                    "ACP agent stderr did not close after kill (likely inherited by a \
+                     grandchild process); abandoning the reader"
+                );
+            }
+        }
 
         acp_result
     }
@@ -1041,6 +1065,47 @@ mod tests {
         assert!(
             result.is_ok(),
             "kill signal should terminate child and unblock stderr reader"
+        );
+    }
+
+    /// Regression: an ACP adapter may spawn a grandchild that inherits the
+    /// stderr pipe (pi-acpinator spawns `pi`). Killing the direct child then
+    /// leaves the write end open and stderr never reaches EOF, so the bridge
+    /// must not wait on the reader unbounded or the job hangs in `running`.
+    #[tokio::test]
+    async fn stderr_wait_is_bounded_when_grandchild_holds_the_pipe() {
+        // `sh` spawns a grandchild `sleep` that inherits stderr, then exits:
+        // the parent dies but the pipe stays open, exactly like pi-acpinator.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & exit 0")
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+
+        let child_stderr = child.stderr.take().unwrap();
+        let (_child_exit_rx, kill_tx) = spawn_child_monitor(child);
+
+        let stderr_handle = tokio::spawn(async move {
+            let reader = BufReader::new(child_stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(_)) = lines.next_line().await {}
+        });
+
+        let _ = kill_tx.send(());
+
+        // Unbounded `stderr_handle.await` would hang here for 300s.
+        let stderr_abort = stderr_handle.abort_handle();
+        let drained = tokio::time::timeout(STDERR_DRAIN_GRACE, stderr_handle).await;
+        if drained.is_err() {
+            stderr_abort.abort();
+        }
+
+        // Either EOF arrived or we gave up; what matters is that we got here.
+        assert!(
+            STDERR_DRAIN_GRACE < Duration::from_secs(30),
+            "grace must be short enough to keep job completion responsive"
         );
     }
 
